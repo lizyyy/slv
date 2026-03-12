@@ -1,0 +1,24 @@
+# SLV白银ETF量化交易系统 - 依赖包
+# 安装命令: pip install -r requirements.txt
+
+# 核心数据处理
+pandas>=1.5.0
+numpy>=1.23.0
+
+# 数据获取 (Yahoo Finance - 免费，无需API Key)
+yfinance>=0.2.18
+
+# 定时任务调度
+apscheduler>=3.10.0
+
+# HTTP请求
+requests>=2.28.0
+
+# 数据可视化 (可选，用于生成图表)
+matplotlib>=3.6.0
+
+# 类型提示支持
+typing-extensions>=4.4.0
+
+# 时区处理
+pytz>=2022.5
