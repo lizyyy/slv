@@ -3,18 +3,21 @@
 SLV ETF 数据采集模块 V2
 数据源优先级：
 1. NASDAQ API - 盘前/盘中/盘后实时价格（主要来源）
-2. Yahoo Finance - 夜盘/延长时间价格（直接获取）
+2. Yahoo Finance API - 夜盘/延长时间价格（北京时间8-16点优先）
 3. Qveris - 最后备用（当以上都失败时）
 """
 
 import requests
 import json
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 from pathlib import Path
 import logging
 import os
+
+# 导入新的Yahoo Finance API模块
+from yahoo_finance_api import YahooFinanceAPI, DataSourceStatus, is_beijing_extended_hours
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -97,6 +100,7 @@ class SLVDataFetcher:
         self.data_dir = Path(data_dir)
         self.historical_file = self.data_dir / "slv_daily_data.csv"
         self.qveris = QverisClient()
+        self.yahoo_api = YahooFinanceAPI()
 
     def get_intraday_data(self) -> Optional[pd.DataFrame]:
         """获取NASDAQ日内实时数据"""
@@ -211,78 +215,165 @@ class SLVDataFetcher:
         """
         获取实时报价
         数据源优先级：
-        1. NASDAQ API（盘前/盘中/盘后实时价格）- 主要来源
-        2. Yahoo Finance（夜盘价格）- 直接获取，补充延长时间数据
-        3. Qveris（最后备用）- 当以上都失败时使用
+        1. 北京时间 8:00-16:00 期间，优先使用 Yahoo Finance API 获取夜盘数据
+        2. NASDAQ API（盘前/盘中/盘后实时价格）- 主要来源
+        3. Yahoo Finance API（夜盘价格）- 补充延长时间数据
+        4. Qveris（最后备用）- 当以上都失败时使用
+        
+        返回数据包含以下标记：
+        - is_extended_hours: 是否为夜盘价格
+        - price_type: 价格类型 (regular_hours/pre_market/post_market/extended_hours)
+        - yahoo_fallback: 是否使用了雅虎数据作为fallback
+        - yahoo_status: 雅虎数据源状态
         """
         quote = None
+        yahoo_fallback = False
+        yahoo_status = None
+        
+        # 判断是否为北京时间延长时间 (8:00-16:00)
+        is_bj_extended = is_beijing_extended_hours()
+        logger.info(f"Beijing extended hours (8-16): {is_bj_extended}")
 
-        # 1. 先尝试 Nasdaq API（主要数据源）
-        logger.info("Trying NASDAQ API...")
-        quote = self._get_nasdaq_quote()
-
-        if quote:
-            logger.info(f"NASDAQ success: ${quote['last_price']}")
-
-            # 获取 Yahoo Finance 夜盘数据作为补充
-            logger.info("Fetching Yahoo Finance extended hours data...")
-            yf_data = self.get_yfinance_data()
-
-            if yf_data:
-                # 补充夜盘数据到 quote
-                quote['pre_market_price'] = yf_data.get('pre_market_price')
-                quote['post_market_price'] = yf_data.get('post_market_price')
-                quote['extended_hours_high'] = yf_data.get('extended_hours_high')
-                quote['extended_hours_low'] = yf_data.get('extended_hours_low')
-                quote['yfinance_regular_price'] = yf_data.get('regular_price')
-
-                # 如果当前是延长时间，且 NASDAQ 数据较旧，使用 Yahoo 的最新价格
-                if yf_data.get('is_extended_hours'):
-                    if yf_data.get('pre_market_price') or yf_data.get('post_market_price'):
-                        latest_yf = yf_data.get('pre_market_price') or yf_data.get('post_market_price')
-                        if latest_yf and quote.get('volume', 0) == 0:
-                            logger.info(f"Market in extended hours, using Yahoo price: ${latest_yf}")
-                            quote['last_price'] = latest_yf
-                            quote['market_status'] = 'extended_hours'
-                            quote['price_source'] = 'yfinance_extended_hours'
-
-                logger.info(f"Yahoo Finance extended hours: pre=${yf_data.get('pre_market_price')}, post=${yf_data.get('post_market_price')}")
-        else:
-            logger.warning("NASDAQ API failed, trying Yahoo Finance...")
-
-            # 2. NASDAQ 失败，尝试 Yahoo Finance
-            yf_data = self.get_yfinance_data()
-            if yf_data and yf_data.get('regular_price'):
+        # 1. 北京时间延长时间优先使用 Yahoo Finance API
+        if is_bj_extended:
+            logger.info("Beijing extended hours detected, trying Yahoo Finance API first...")
+            yahoo_data = self.yahoo_api.get_extended_hours_price("SLV")
+            yahoo_status = yahoo_data.source_status.value
+            
+            if yahoo_data.source_status == DataSourceStatus.SUCCESS and yahoo_data.last_price:
                 quote = {
                     'symbol': 'SLV',
                     'name': 'iShares Silver Trust',
-                    'last_price': yf_data.get('regular_price'),
-                    'net_change': None,
-                    'change_pct': None,
-                    'volume': None,
+                    'last_price': yahoo_data.last_price,
+                    'net_change': yahoo_data.net_change,
+                    'change_pct': yahoo_data.change_pct,
+                    'volume': yahoo_data.volume,
                     'bid': None,
                     'ask': None,
-                    'timestamp': None,
-                    'is_realtime': False,
-                    'price_source': 'yfinance',
-                    'market_status': 'extended_hours' if yf_data.get('is_extended_hours') else 'regular_hours',
-                    'pre_market_price': yf_data.get('pre_market_price'),
-                    'post_market_price': yf_data.get('post_market_price'),
-                    'extended_hours_high': yf_data.get('extended_hours_high'),
-                    'extended_hours_low': yf_data.get('extended_hours_low'),
+                    'timestamp': yahoo_data.timestamp.isoformat() if yahoo_data.timestamp else None,
+                    'is_realtime': True,
+                    'price_source': 'yahoo_api_extended_hours',
+                    'market_status': 'extended_hours',
+                    'is_extended_hours': yahoo_data.is_extended_hours,
+                    'price_type': yahoo_data.price_type.value,
+                    'pre_market_price': yahoo_data.pre_market_price,
+                    'post_market_price': yahoo_data.post_market_price,
+                    'extended_hours_high': yahoo_data.extended_hours_high,
+                    'extended_hours_low': yahoo_data.extended_hours_low,
+                    'previous_close': yahoo_data.previous_close,
+                    'yahoo_fallback': False,
+                    'yahoo_status': yahoo_status,
                 }
-                logger.info(f"Using Yahoo Finance: ${quote['last_price']}")
+                logger.info(f"Yahoo API success (priority): ${quote['last_price']}, type={quote['price_type']}")
+            else:
+                logger.warning(f"Yahoo API failed: {yahoo_status}, will try NASDAQ...")
+                yahoo_fallback = True
 
-        # 3. 最后备用：Qveris
+        # 2. 非延长时间或 Yahoo 失败时，尝试 NASDAQ API
+        if not quote:
+            logger.info("Trying NASDAQ API...")
+            quote = self._get_nasdaq_quote()
+
+            if quote:
+                logger.info(f"NASDAQ success: ${quote['last_price']}")
+                
+                # 获取 Yahoo Finance 夜盘数据作为补充
+                logger.info("Fetching Yahoo Finance extended hours data as supplement...")
+                yahoo_data = self.yahoo_api.get_extended_hours_price("SLV")
+                yahoo_status = yahoo_data.source_status.value
+                
+                if yahoo_data.source_status == DataSourceStatus.SUCCESS:
+                    # 补充夜盘数据到 quote
+                    quote['pre_market_price'] = yahoo_data.pre_market_price
+                    quote['post_market_price'] = yahoo_data.post_market_price
+                    quote['extended_hours_high'] = yahoo_data.extended_hours_high
+                    quote['extended_hours_low'] = yahoo_data.extended_hours_low
+                    quote['is_extended_hours'] = yahoo_data.is_extended_hours
+                    quote['price_type'] = yahoo_data.price_type.value
+                    quote['yahoo_fallback'] = yahoo_fallback
+                    quote['yahoo_status'] = yahoo_status
+                    
+                    # 如果当前是延长时间，且 NASDAQ 数据较旧，使用 Yahoo 的最新价格
+                    if yahoo_data.is_extended_hours and yahoo_data.last_price:
+                        if quote.get('volume', 0) == 0 or yahoo_data.price_type.value in ['post_market', 'pre_market']:
+                            logger.info(f"Market in extended hours, using Yahoo price: ${yahoo_data.last_price}")
+                            quote['last_price'] = yahoo_data.last_price
+                            quote['net_change'] = yahoo_data.net_change
+                            quote['change_pct'] = yahoo_data.change_pct
+                            quote['market_status'] = 'extended_hours'
+                            quote['price_source'] = 'yahoo_api_extended_hours'
+                    
+                    logger.info(f"Yahoo supplement: pre=${yahoo_data.pre_market_price}, post=${yahoo_data.post_market_price}")
+                else:
+                    quote['is_extended_hours'] = False
+                    quote['price_type'] = 'regular_hours'
+                    quote['yahoo_fallback'] = yahoo_fallback
+                    quote['yahoo_status'] = yahoo_status
+        else:
+            # 已经在延长时间模式获取到Yahoo数据，补充NASDAQ作为备选
+            logger.info("Fetching NASDAQ data as supplement...")
+            nasdaq_quote = self._get_nasdaq_quote()
+            if nasdaq_quote:
+                quote['nasdaq_backup_price'] = nasdaq_quote.get('last_price')
+
+        # 3. 如果 NASDAQ 失败且之前没有获取到 Yahoo 数据，尝试 Yahoo 作为备选
+        if not quote:
+            logger.warning("NASDAQ API failed, trying Yahoo Finance as fallback...")
+            yahoo_data = self.yahoo_api.get_extended_hours_price("SLV")
+            yahoo_status = yahoo_data.source_status.value
+            
+            if yahoo_data.source_status == DataSourceStatus.SUCCESS and yahoo_data.last_price:
+                quote = {
+                    'symbol': 'SLV',
+                    'name': 'iShares Silver Trust',
+                    'last_price': yahoo_data.last_price,
+                    'net_change': yahoo_data.net_change,
+                    'change_pct': yahoo_data.change_pct,
+                    'volume': yahoo_data.volume,
+                    'bid': None,
+                    'ask': None,
+                    'timestamp': yahoo_data.timestamp.isoformat() if yahoo_data.timestamp else None,
+                    'is_realtime': True,
+                    'price_source': 'yahoo_api_fallback',
+                    'market_status': 'extended_hours' if yahoo_data.is_extended_hours else 'regular_hours',
+                    'is_extended_hours': yahoo_data.is_extended_hours,
+                    'price_type': yahoo_data.price_type.value,
+                    'pre_market_price': yahoo_data.pre_market_price,
+                    'post_market_price': yahoo_data.post_market_price,
+                    'extended_hours_high': yahoo_data.extended_hours_high,
+                    'extended_hours_low': yahoo_data.extended_hours_low,
+                    'previous_close': yahoo_data.previous_close,
+                    'yahoo_fallback': True,
+                    'yahoo_status': yahoo_status,
+                }
+                logger.info(f"Using Yahoo API fallback: ${quote['last_price']}")
+
+        # 4. 最后备用：Qveris
         if not quote:
             logger.warning("All primary sources failed, trying Qveris as fallback...")
             qveris_data = self.qveris.get_quote("SLV")
             if qveris_data and qveris_data.get('last_price'):
                 quote = qveris_data
+                quote['is_extended_hours'] = False
+                quote['price_type'] = 'unknown'
+                quote['yahoo_fallback'] = True
+                quote['yahoo_status'] = yahoo_status or 'all_failed'
                 logger.info(f"Using Qveris fallback: ${quote['last_price']}")
 
         if not quote:
             logger.error("All data sources failed!")
+            # 返回一个带有错误信息的空结构
+            return {
+                'symbol': 'SLV',
+                'name': 'iShares Silver Trust',
+                'last_price': None,
+                'price_source': 'all_failed',
+                'is_extended_hours': False,
+                'price_type': 'unknown',
+                'yahoo_fallback': True,
+                'yahoo_status': yahoo_status or 'all_failed',
+                'error': 'All data sources failed'
+            }
 
         return quote
 
@@ -511,6 +602,10 @@ def test_fetcher():
         print(f"  成交量: {quote.get('volume', 'N/A')}")
         print(f"  数据源: {quote.get('price_source', 'N/A')}")
         print(f"  市场状态: {quote.get('market_status', 'N/A')}")
+        print(f"  是否夜盘: {quote.get('is_extended_hours', False)}")
+        print(f"  价格类型: {quote.get('price_type', 'N/A')}")
+        print(f"  Yahoo Fallback: {quote.get('yahoo_fallback', False)}")
+        print(f"  Yahoo 状态: {quote.get('yahoo_status', 'N/A')}")
         if quote.get('pre_market_price'):
             print(f"  盘前价: ${quote['pre_market_price']}")
         if quote.get('post_market_price'):
