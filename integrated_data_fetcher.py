@@ -78,7 +78,7 @@ class IntegratedDataFetcher:
 
         # 优先使用实时报价数据
         current_price = quote.get('last_price') or latest.get('close', 0)
-        current_volume = quote.get('volume') or latest.get('volume', 0)
+        current_volume = quote.get('volume') if quote.get('volume') is not None else latest.get('volume', 0)
         net_change = quote.get('net_change', 0)
         change_pct = quote.get('change_pct', 0)
 
@@ -116,7 +116,19 @@ class IntegratedDataFetcher:
                 "volume_vs_avg": round(current_volume / avg_volume, 2) if avg_volume else 1.0,
                 "high_52w": round(high_52w, 2),
                 "low_52w": round(low_52w, 2),
-                "price_position": round(price_position, 2)
+                "price_position": round(price_position, 2),
+                "quote_source": quote.get("price_source"),
+                "market_status": quote.get("market_status"),
+                "is_night_session_price": quote.get("is_night_session", False),
+                "yahoo_preferred_window": quote.get("yahoo_preferred_window", False),
+                "yahoo_attempted": quote.get("yahoo_attempted", False),
+                "yahoo_available": quote.get("yahoo_available", False),
+                "yahoo_used_for_price": quote.get("yahoo_used_for_price", False),
+                "yahoo_failure_reason": quote.get("yahoo_failure_reason"),
+                "yahoo_failure_message": quote.get("yahoo_failure_message"),
+                "yahoo_rate_limited": quote.get("yahoo_rate_limited", False),
+                "yahoo_timed_out": quote.get("yahoo_timed_out", False),
+                "yahoo_status": quote.get("yahoo_status"),
             },
             "correlated_markets": {
                 "dxy": {
