@@ -10,7 +10,7 @@ SLV ETF 数据采集模块 V2
 import requests
 import json
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 from pathlib import Path
 import logging
@@ -18,6 +18,21 @@ import os
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+
+def is_beijing_night_session() -> bool:
+    """
+    判断当前是否在北京时间夜盘时段 (8:00-16:00)
+    夜盘时段优先使用雅虎实时数据
+    """
+    try:
+        beijing_tz = timezone(timedelta(hours=8))
+        now = datetime.now(beijing_tz)
+        hour = now.hour
+        return 8 <= hour < 16
+    except Exception as e:
+        logger.warning(f"判断北京时间时段失败: {e}")
+        return False
 
 
 class QverisClient:
@@ -97,6 +112,238 @@ class SLVDataFetcher:
         self.data_dir = Path(data_dir)
         self.historical_file = self.data_dir / "slv_daily_data.csv"
         self.qveris = QverisClient()
+        self.yahoo_timeout_count = 0
+        self.yahoo_max_timeout = 3
+        self.yahoo_crumb = None
+        self.yahoo_cookie = None
+
+    def _get_yahoo_crumb(self) -> Tuple[Optional[str], Optional[str]]:
+        """
+        获取雅虎API所需的crumb token和cookie
+        雅虎API需要这些来验证请求
+        """
+        if self.yahoo_crumb and self.yahoo_cookie:
+            return self.yahoo_crumb, self.yahoo_cookie
+
+        try:
+            session = requests.Session()
+            session.headers.update({
+                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.9',
+            })
+
+            response = session.get('https://finance.yahoo.com', timeout=10)
+            cookies = session.cookies.get_dict()
+            cookie_str = '; '.join([f'{k}={v}' for k, v in cookies.items()])
+
+            crumb_response = session.get('https://query1.finance.yahoo.com/v1/test/getcrumb', timeout=10)
+            if crumb_response.status_code == 200:
+                crumb = crumb_response.text.strip()
+                self.yahoo_crumb = crumb
+                self.yahoo_cookie = cookie_str
+                logger.info(f"获取雅虎crumb成功")
+                return crumb, cookie_str
+
+        except Exception as e:
+            logger.warning(f"获取雅虎crumb失败: {e}")
+
+        return None, None
+
+    def get_yahoo_realtime_quote(self) -> Optional[Dict]:
+        """
+        直接调用雅虎API获取实时报价
+        接口: https://query1.finance.yahoo.com/v7/finance/quote?symbols=SLV
+        """
+        if self.yahoo_timeout_count >= self.yahoo_max_timeout:
+            logger.warning(f"雅虎API超时次数已达上限({self.yahoo_max_timeout})，跳过本次请求")
+            return None
+
+        crumb, cookie = self._get_yahoo_crumb()
+        
+        url = "https://query1.finance.yahoo.com/v7/finance/quote"
+        params = {"symbols": "SLV"}
+        if crumb:
+            params["crumb"] = crumb
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'application/json, text/plain, */*',
+            'Accept-Language': 'en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Origin': 'https://finance.yahoo.com',
+            'Referer': 'https://finance.yahoo.com/',
+            'Sec-Fetch-Dest': 'empty',
+            'Sec-Fetch-Mode': 'cors',
+            'Sec-Fetch-Site': 'same-site',
+        }
+        if cookie:
+            headers['Cookie'] = cookie
+
+        try:
+            logger.info("Fetching Yahoo Finance realtime quote...")
+            response = requests.get(url, params=params, headers=headers, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+
+            quote_response = data.get('quoteResponse', {})
+            results = quote_response.get('result', [])
+
+            if not results:
+                logger.warning("Yahoo quote response is empty")
+                return None
+
+            quote_data = results[0]
+            return {
+                'symbol': 'SLV',
+                'name': quote_data.get('longName', 'iShares Silver Trust'),
+                'last_price': quote_data.get('regularMarketPrice'),
+                'net_change': quote_data.get('regularMarketChange'),
+                'change_pct': quote_data.get('regularMarketChangePercent'),
+                'volume': quote_data.get('regularMarketVolume'),
+                'open': quote_data.get('regularMarketOpen'),
+                'high': quote_data.get('regularMarketDayHigh'),
+                'low': quote_data.get('regularMarketDayLow'),
+                'previous_close': quote_data.get('regularMarketPreviousClose'),
+                'fifty_two_week_high': quote_data.get('fiftyTwoWeekHigh'),
+                'fifty_two_week_low': quote_data.get('fiftyTwoWeekLow'),
+                'pre_market_price': quote_data.get('preMarketPrice'),
+                'post_market_price': quote_data.get('postMarketPrice'),
+                'market_state': quote_data.get('marketState'),
+                'data_source': 'yahoo_api_direct',
+                'yahoo_fetch_failed': False,
+                'yahoo_fetch_timeout': False
+            }
+
+        except requests.exceptions.Timeout:
+            self.yahoo_timeout_count += 1
+            logger.error(f"Yahoo API timeout ({self.yahoo_timeout_count}/{self.yahoo_max_timeout})")
+            return {
+                'symbol': 'SLV',
+                'last_price': None,
+                'data_source': 'yahoo_api_direct',
+                'yahoo_fetch_failed': True,
+                'yahoo_fetch_timeout': True
+            }
+        except Exception as e:
+            logger.error(f"Yahoo API error: {e}")
+            return {
+                'symbol': 'SLV',
+                'last_price': None,
+                'data_source': 'yahoo_api_direct',
+                'yahoo_fetch_failed': True,
+                'yahoo_fetch_timeout': False
+            }
+
+    def get_yahoo_minute_chart(self) -> Optional[Dict]:
+        """
+        直接调用雅虎API获取分钟级行情/夜盘数据
+        接口: https://query2.finance.yahoo.com/v8/finance/chart/SLV?interval=1m&range=1d&includePrePost=true
+        """
+        if self.yahoo_timeout_count >= self.yahoo_max_timeout:
+            logger.warning(f"雅虎API超时次数已达上限({self.yahoo_max_timeout})，跳过本次请求")
+            return None
+
+        crumb, cookie = self._get_yahoo_crumb()
+
+        url = "https://query2.finance.yahoo.com/v8/finance/chart/SLV"
+        params = {
+            "interval": "1m",
+            "range": "1d",
+            "includePrePost": "true"
+        }
+        if crumb:
+            params["crumb"] = crumb
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'application/json, text/plain, */*',
+            'Accept-Language': 'en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Origin': 'https://finance.yahoo.com',
+            'Referer': 'https://finance.yahoo.com/',
+            'Sec-Fetch-Dest': 'empty',
+            'Sec-Fetch-Mode': 'cors',
+            'Sec-Fetch-Site': 'same-site',
+        }
+        if cookie:
+            headers['Cookie'] = cookie
+
+        try:
+            logger.info("Fetching Yahoo Finance minute chart (night session data)...")
+            response = requests.get(url, params=params, headers=headers, timeout=15)
+            response.raise_for_status()
+            data = response.json()
+
+            chart_result = data.get('chart', {}).get('result', [])
+            if not chart_result:
+                logger.warning("Yahoo chart response is empty")
+                return None
+
+            result = chart_result[0]
+            meta = result.get('meta', {})
+            timestamps = result.get('timestamp', [])
+            indicators = result.get('indicators', {}).get('quote', [])
+
+            if not timestamps or not indicators:
+                logger.warning("Yahoo chart data incomplete")
+                return None
+
+            quote_data = indicators[0]
+            minute_prices = []
+            for i, ts in enumerate(timestamps):
+                if ts and quote_data.get('close') and i < len(quote_data['close']):
+                    dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+                    minute_prices.append({
+                        'datetime': dt,
+                        'timestamp': ts,
+                        'open': quote_data['open'][i] if quote_data.get('open') else None,
+                        'high': quote_data['high'][i] if quote_data.get('high') else None,
+                        'low': quote_data['low'][i] if quote_data.get('low') else None,
+                        'close': quote_data['close'][i] if quote_data.get('close') else None,
+                        'volume': quote_data['volume'][i] if quote_data.get('volume') else None
+                    })
+
+            latest_price = meta.get('regularMarketPrice')
+            if minute_prices:
+                latest_price = minute_prices[-1]['close'] or latest_price
+
+            return {
+                'symbol': 'SLV',
+                'name': meta.get('shortName', 'iShares Silver Trust'),
+                'last_price': latest_price,
+                'previous_close': meta.get('chartPreviousClose'),
+                'regular_market_price': meta.get('regularMarketPrice'),
+                'fifty_two_week_high': meta.get('fiftyTwoWeekHigh'),
+                'fifty_two_week_low': meta.get('fiftyTwoWeekLow'),
+                'day_high': meta.get('regularMarketDayHigh'),
+                'day_low': meta.get('regularMarketDayLow'),
+                'volume': meta.get('regularMarketVolume'),
+                'currency': meta.get('currency', 'USD'),
+                'exchange': meta.get('exchangeName'),
+                'minute_prices': minute_prices,
+                'data_source': 'yahoo_chart_api',
+                'yahoo_fetch_failed': False,
+                'yahoo_fetch_timeout': False
+            }
+
+        except requests.exceptions.Timeout:
+            self.yahoo_timeout_count += 1
+            logger.error(f"Yahoo Chart API timeout ({self.yahoo_timeout_count}/{self.yahoo_max_timeout})")
+            return {
+                'symbol': 'SLV',
+                'last_price': None,
+                'data_source': 'yahoo_chart_api',
+                'yahoo_fetch_failed': True,
+                'yahoo_fetch_timeout': True
+            }
+        except Exception as e:
+            logger.error(f"Yahoo Chart API error: {e}")
+            return {
+                'symbol': 'SLV',
+                'last_price': None,
+                'data_source': 'yahoo_chart_api',
+                'yahoo_fetch_failed': True,
+                'yahoo_fetch_timeout': False
+            }
 
     def get_intraday_data(self) -> Optional[pd.DataFrame]:
         """获取NASDAQ日内实时数据"""
@@ -211,78 +458,140 @@ class SLVDataFetcher:
         """
         获取实时报价
         数据源优先级：
-        1. NASDAQ API（盘前/盘中/盘后实时价格）- 主要来源
-        2. Yahoo Finance（夜盘价格）- 直接获取，补充延长时间数据
-        3. Qveris（最后备用）- 当以上都失败时使用
+        - 北京时间 8:00-16:00 (夜盘时段):
+          1. Yahoo Finance API (直接调用) - 优先获取夜盘数据
+          2. NASDAQ API - 备用
+          3. Qveris - 最后备用
+        - 其他时段:
+          1. NASDAQ API（盘前/盘中/盘后实时价格）- 主要来源
+          2. Yahoo Finance（夜盘价格）- 补充延长时间数据
+          3. Qveris（最后备用）
         """
         quote = None
+        is_night_session = is_beijing_night_session()
 
-        # 1. 先尝试 Nasdaq API（主要数据源）
-        logger.info("Trying NASDAQ API...")
-        quote = self._get_nasdaq_quote()
+        if is_night_session:
+            logger.info("检测到北京时间夜盘时段 (8:00-16:00)，优先使用雅虎API...")
 
-        if quote:
-            logger.info(f"NASDAQ success: ${quote['last_price']}")
+            yahoo_quote = self.get_yahoo_realtime_quote()
+            yahoo_chart = self.get_yahoo_minute_chart()
 
-            # 获取 Yahoo Finance 夜盘数据作为补充
-            logger.info("Fetching Yahoo Finance extended hours data...")
-            yf_data = self.get_yfinance_data()
+            if yahoo_quote and yahoo_quote.get('last_price') and not yahoo_quote.get('yahoo_fetch_failed'):
+                quote = yahoo_quote.copy()
+                quote['is_night_session'] = True
+                quote['market_status'] = 'night_session'
+                quote['price_source'] = 'yahoo_api_night_session'
+                quote['yahoo_fetch_failed'] = False
+                quote['yahoo_fetch_timeout'] = False
 
-            if yf_data:
-                # 补充夜盘数据到 quote
-                quote['pre_market_price'] = yf_data.get('pre_market_price')
-                quote['post_market_price'] = yf_data.get('post_market_price')
-                quote['extended_hours_high'] = yf_data.get('extended_hours_high')
-                quote['extended_hours_low'] = yf_data.get('extended_hours_low')
-                quote['yfinance_regular_price'] = yf_data.get('regular_price')
+                if yahoo_chart and yahoo_chart.get('minute_prices'):
+                    quote['minute_prices'] = yahoo_chart['minute_prices']
+                    quote['day_high'] = yahoo_chart.get('day_high')
+                    quote['day_low'] = yahoo_chart.get('day_low')
 
-                # 如果当前是延长时间，且 NASDAQ 数据较旧，使用 Yahoo 的最新价格
-                if yf_data.get('is_extended_hours'):
-                    if yf_data.get('pre_market_price') or yf_data.get('post_market_price'):
-                        latest_yf = yf_data.get('pre_market_price') or yf_data.get('post_market_price')
-                        if latest_yf and quote.get('volume', 0) == 0:
-                            logger.info(f"Market in extended hours, using Yahoo price: ${latest_yf}")
-                            quote['last_price'] = latest_yf
-                            quote['market_status'] = 'extended_hours'
-                            quote['price_source'] = 'yfinance_extended_hours'
+                logger.info(f"Yahoo API 夜盘数据获取成功: ${quote['last_price']}")
+            else:
+                yahoo_failed = yahoo_quote.get('yahoo_fetch_failed') if yahoo_quote else True
+                yahoo_timeout = yahoo_quote.get('yahoo_fetch_timeout') if yahoo_quote else False
 
-                logger.info(f"Yahoo Finance extended hours: pre=${yf_data.get('pre_market_price')}, post=${yf_data.get('post_market_price')}")
+                logger.warning(f"Yahoo API 夜盘数据获取失败，尝试备用数据源...")
+
+                nasdaq_quote = self._get_nasdaq_quote()
+                if nasdaq_quote and nasdaq_quote.get('last_price'):
+                    quote = nasdaq_quote
+                    quote['is_night_session'] = True
+                    quote['yahoo_fetch_failed'] = yahoo_failed
+                    quote['yahoo_fetch_timeout'] = yahoo_timeout
+                    logger.info(f"使用 NASDAQ 备用数据: ${quote['last_price']}")
+                else:
+                    qveris_quote = self.qveris.get_quote("SLV")
+                    if qveris_quote and qveris_quote.get('last_price'):
+                        quote = qveris_quote
+                        quote['is_night_session'] = True
+                        quote['yahoo_fetch_failed'] = yahoo_failed
+                        quote['yahoo_fetch_timeout'] = yahoo_timeout
+                        logger.info(f"使用 Qveris 备用数据: ${quote['last_price']}")
         else:
-            logger.warning("NASDAQ API failed, trying Yahoo Finance...")
+            logger.info("非夜盘时段，使用常规数据源优先级...")
 
-            # 2. NASDAQ 失败，尝试 Yahoo Finance
-            yf_data = self.get_yfinance_data()
-            if yf_data and yf_data.get('regular_price'):
-                quote = {
-                    'symbol': 'SLV',
-                    'name': 'iShares Silver Trust',
-                    'last_price': yf_data.get('regular_price'),
-                    'net_change': None,
-                    'change_pct': None,
-                    'volume': None,
-                    'bid': None,
-                    'ask': None,
-                    'timestamp': None,
-                    'is_realtime': False,
-                    'price_source': 'yfinance',
-                    'market_status': 'extended_hours' if yf_data.get('is_extended_hours') else 'regular_hours',
-                    'pre_market_price': yf_data.get('pre_market_price'),
-                    'post_market_price': yf_data.get('post_market_price'),
-                    'extended_hours_high': yf_data.get('extended_hours_high'),
-                    'extended_hours_low': yf_data.get('extended_hours_low'),
-                }
-                logger.info(f"Using Yahoo Finance: ${quote['last_price']}")
+            logger.info("Trying NASDAQ API...")
+            quote = self._get_nasdaq_quote()
 
-        # 3. 最后备用：Qveris
+            if quote:
+                logger.info(f"NASDAQ success: ${quote['last_price']}")
+
+                logger.info("Fetching Yahoo Finance extended hours data...")
+                yf_data = self.get_yfinance_data()
+
+                if yf_data:
+                    quote['pre_market_price'] = yf_data.get('pre_market_price')
+                    quote['post_market_price'] = yf_data.get('post_market_price')
+                    quote['extended_hours_high'] = yf_data.get('extended_hours_high')
+                    quote['extended_hours_low'] = yf_data.get('extended_hours_low')
+                    quote['yfinance_regular_price'] = yf_data.get('regular_price')
+
+                    if yf_data.get('is_extended_hours'):
+                        if yf_data.get('pre_market_price') or yf_data.get('post_market_price'):
+                            latest_yf = yf_data.get('pre_market_price') or yf_data.get('post_market_price')
+                            if latest_yf and quote.get('volume', 0) == 0:
+                                logger.info(f"Market in extended hours, using Yahoo price: ${latest_yf}")
+                                quote['last_price'] = latest_yf
+                                quote['market_status'] = 'extended_hours'
+                                quote['price_source'] = 'yfinance_extended_hours'
+
+                    logger.info(f"Yahoo Finance extended hours: pre=${yf_data.get('pre_market_price')}, post=${yf_data.get('post_market_price')}")
+
+                quote['is_night_session'] = False
+                quote['yahoo_fetch_failed'] = False
+                quote['yahoo_fetch_timeout'] = False
+            else:
+                logger.warning("NASDAQ API failed, trying Yahoo Finance...")
+
+                yf_data = self.get_yfinance_data()
+                if yf_data and yf_data.get('regular_price'):
+                    quote = {
+                        'symbol': 'SLV',
+                        'name': 'iShares Silver Trust',
+                        'last_price': yf_data.get('regular_price'),
+                        'net_change': None,
+                        'change_pct': None,
+                        'volume': None,
+                        'bid': None,
+                        'ask': None,
+                        'timestamp': None,
+                        'is_realtime': False,
+                        'price_source': 'yfinance',
+                        'market_status': 'extended_hours' if yf_data.get('is_extended_hours') else 'regular_hours',
+                        'pre_market_price': yf_data.get('pre_market_price'),
+                        'post_market_price': yf_data.get('post_market_price'),
+                        'extended_hours_high': yf_data.get('extended_hours_high'),
+                        'extended_hours_low': yf_data.get('extended_hours_low'),
+                        'is_night_session': False,
+                        'yahoo_fetch_failed': False,
+                        'yahoo_fetch_timeout': False,
+                    }
+                    logger.info(f"Using Yahoo Finance: ${quote['last_price']}")
+
         if not quote:
             logger.warning("All primary sources failed, trying Qveris as fallback...")
             qveris_data = self.qveris.get_quote("SLV")
             if qveris_data and qveris_data.get('last_price'):
                 quote = qveris_data
+                quote['is_night_session'] = is_night_session
+                quote['yahoo_fetch_failed'] = True
+                quote['yahoo_fetch_timeout'] = False
                 logger.info(f"Using Qveris fallback: ${quote['last_price']}")
 
         if not quote:
             logger.error("All data sources failed!")
+            return {
+                'symbol': 'SLV',
+                'last_price': None,
+                'is_night_session': is_night_session,
+                'yahoo_fetch_failed': True,
+                'yahoo_fetch_timeout': False,
+                'error': 'All data sources failed'
+            }
 
         return quote
 
@@ -493,50 +802,63 @@ class SLVDataFetcher:
 
 def test_fetcher():
     """测试数据采集器"""
-    fetcher = SLVDataFetcher(data_dir="/Users/lzy/pro/slv")
+    fetcher = SLVDataFetcher(data_dir="/Users/lzy/pro/dogfood/pro_18/br_02")
 
     print("=" * 60)
-    print("测试SLV数据采集器 V2")
-    print("数据源优先级: NASDAQ > Yahoo Finance > Qveris")
+    print("测试SLV数据采集器 V2 (支持夜盘时段)")
     print("=" * 60)
 
-    # 获取实时报价
+    print(f"\n当前北京时间时段: {'夜盘时段 (8:00-16:00)' if is_beijing_night_session() else '非夜盘时段'}")
+
     print("\n1. 获取实时报价...")
     quote = fetcher.get_current_quote()
     if quote:
         print(f"✓ 实时报价:")
-        print(f"  当前价: ${quote['last_price']}")
+        print(f"  当前价: ${quote.get('last_price', 'N/A')}")
         print(f"  涨跌: {quote.get('net_change', 'N/A')}")
         print(f"  涨跌幅: {quote.get('change_pct', 'N/A')}%")
         print(f"  成交量: {quote.get('volume', 'N/A')}")
-        print(f"  数据源: {quote.get('price_source', 'N/A')}")
+        print(f"  数据源: {quote.get('price_source', quote.get('data_source', 'N/A'))}")
         print(f"  市场状态: {quote.get('market_status', 'N/A')}")
+        print(f"  --- 夜盘标记 ---")
+        print(f"  是否夜盘价格: {'是' if quote.get('is_night_session') else '否'}")
+        print(f"  雅虎获取失败: {'是' if quote.get('yahoo_fetch_failed') else '否'}")
+        print(f"  雅虎超时: {'是' if quote.get('yahoo_fetch_timeout') else '否'}")
         if quote.get('pre_market_price'):
             print(f"  盘前价: ${quote['pre_market_price']}")
         if quote.get('post_market_price'):
             print(f"  盘后价: ${quote['post_market_price']}")
-        if quote.get('extended_hours_high'):
-            print(f"  夜盘最高: ${quote['extended_hours_high']}")
-        if quote.get('extended_hours_low'):
-            print(f"  夜盘最低: ${quote['extended_hours_low']}")
+        if quote.get('day_high'):
+            print(f"  日最高: ${quote['day_high']}")
+        if quote.get('day_low'):
+            print(f"  日最低: ${quote['day_low']}")
+        if quote.get('minute_prices'):
+            print(f"  分钟数据条数: {len(quote['minute_prices'])}")
     else:
         print("✗ 获取实时报价失败")
 
-    # 测试 Yahoo Finance 直接获取
-    print("\n2. 测试 Yahoo Finance 夜盘数据...")
-    yf_data = fetcher.get_yfinance_data()
-    if yf_data:
-        print(f"✓ Yahoo Finance:")
-        print(f"  常规价: ${yf_data.get('regular_price')}")
-        print(f"  盘前价: ${yf_data.get('pre_market_price')}")
-        print(f"  盘后价: ${yf_data.get('post_market_price')}")
-        print(f"  夜盘最高: ${yf_data.get('extended_hours_high')}")
-        print(f"  夜盘最低: ${yf_data.get('extended_hours_low')}")
+    print("\n2. 测试雅虎API直接获取报价...")
+    yahoo_quote = fetcher.get_yahoo_realtime_quote()
+    if yahoo_quote and not yahoo_quote.get('yahoo_fetch_failed'):
+        print(f"✓ 雅虎报价API:")
+        print(f"  价格: ${yahoo_quote.get('last_price')}")
+        print(f"  盘前价: ${yahoo_quote.get('pre_market_price')}")
+        print(f"  盘后价: ${yahoo_quote.get('post_market_price')}")
+        print(f"  市场状态: {yahoo_quote.get('market_state')}")
     else:
-        print("✗ Yahoo Finance 获取失败")
+        print(f"✗ 雅虎报价API获取失败 (timeout={yahoo_quote.get('yahoo_fetch_timeout') if yahoo_quote else 'N/A'})")
 
-    # 测试 Qveris 备用
-    print("\n3. 测试 Qveris 备用数据...")
+    print("\n3. 测试雅虎分钟级行情...")
+    yahoo_chart = fetcher.get_yahoo_minute_chart()
+    if yahoo_chart and not yahoo_chart.get('yahoo_fetch_failed'):
+        print(f"✓ 雅虎分钟行情API:")
+        print(f"  最新价: ${yahoo_chart.get('last_price')}")
+        print(f"  昨收: ${yahoo_chart.get('previous_close')}")
+        print(f"  分钟数据条数: {len(yahoo_chart.get('minute_prices', []))}")
+    else:
+        print(f"✗ 雅虎分钟行情API获取失败 (timeout={yahoo_chart.get('yahoo_fetch_timeout') if yahoo_chart else 'N/A'})")
+
+    print("\n4. 测试 Qveris 备用数据...")
     qveris_data = fetcher.qveris.get_quote("SLV")
     if qveris_data:
         print(f"✓ Qveris:")
