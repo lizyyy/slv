@@ -503,12 +503,33 @@ class SLVAnalyzer:
         volume = quote.get('volume', 0)
         if volume is None:
             volume = 0
+        
+        # 判断是否为夜盘价格
+        is_extended = quote.get('is_extended_hours', False)
+        price_type = quote.get('price_type', 'unknown')
+        yahoo_fallback = quote.get('yahoo_fallback', False)
+        yahoo_status = quote.get('yahoo_status', 'unknown')
+        
+        # 价格类型中文映射
+        price_type_cn = {
+            'regular_hours': '常规交易时间',
+            'pre_market': '盘前交易',
+            'post_market': '盘后交易',
+            'extended_hours': '延长时间',
+            'unknown': '未知'
+        }
+        
         print(f"\n📈 基本信息")
         print("-"*70)
         print(f"当前价格: ${self.current_price:.2f}")
         print(f"涨跌: {self.current_price - prev_close:+.2f} ({((self.current_price - prev_close)/prev_close*100) if prev_close else 0:+.2f}%)")
         print(f"成交量: {volume:,}")
         print(f"数据源: {quote.get('price_source', 'unknown')}")
+        print(f"价格类型: {price_type_cn.get(price_type, price_type)} {'🌙' if is_extended else '☀️'}")
+        if is_extended:
+            print(f"⚠️  注意: 当前为夜盘/延长时间价格")
+        if yahoo_fallback:
+            print(f"⚠️  注意: Yahoo数据获取失败 ({yahoo_status})，已使用备用数据源")
 
         # 打印技术指标
         ind = self.indicators
