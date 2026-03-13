@@ -15,6 +15,7 @@ from typing import Dict, List, Optional, Tuple
 from pathlib import Path
 import logging
 import os
+import pytz
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -97,6 +98,188 @@ class SLVDataFetcher:
         self.data_dir = Path(data_dir)
         self.historical_file = self.data_dir / "slv_daily_data.csv"
         self.qveris = QverisClient()
+        self.beijing_tz = pytz.timezone('Asia/Shanghai')
+        self.yahoo_error = False
+
+    def is_beijing_night_window(self) -> bool:
+        """判断是否在北京时间早上8点到下午16点的夜盘优先窗口"""
+        beijing_now = datetime.now(self.beijing_tz)
+        hour = beijing_now.hour
+        return 8 <= hour < 16
+
+    def get_yahoo_night_session_data(self) -> Tuple[Optional[Dict], bool]:
+        """
+        直接调用Yahoo API获取夜盘分钟级数据
+        返回: (数据字典, 是否成功)
+        数据字典包含: is_night_market, last_price, volume, timestamp 等
+        """
+        yahoo_error = False
+        try:
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15',
+                'Accept': '*/*',
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Referer': 'https://finance.yahoo.com/',
+            }
+            url = 'https://query2.finance.yahoo.com/v8/finance/chart/SLV?interval=1m&range=1d&includePrePost=true'
+            response = self.session.get(url, headers=headers, timeout=15)
+            
+            if response.status_code == 429:
+                logger.warning("Yahoo API rate limited (429)")
+                yahoo_error = True
+                return None, True
+            if response.status_code != 200:
+                logger.warning(f"Yahoo API returned status: {response.status_code}")
+                yahoo_error = True
+                return None, True
+            
+            data = response.json()
+            result = data.get('chart', {}).get('result', [])
+            if not result:
+                logger.warning("Yahoo API no result")
+                yahoo_error = True
+                return None, True
+            
+            chart_data = result[0]
+            meta = chart_data.get('meta', {})
+            timestamps = chart_data.get('timestamp', [])
+            indicators = chart_data.get('indicators', {}).get('quote', [{}])[0]
+            
+            if not timestamps or not indicators:
+                logger.warning("Yahoo API no timestamps or indicators")
+                yahoo_error = True
+                return None, True
+            
+            current_trading_period = meta.get('currentTradingPeriod', {})
+            market_state = meta.get('marketState', '').lower()
+            
+            close_prices = [p for p in indicators.get('close', []) if p is not None]
+            volumes = [v for v in indicators.get('volume', []) if v is not None]
+            high_prices = [h for h in indicators.get('high', []) if h is not None]
+            low_prices = [l for l in indicators.get('low', []) if l is not None]
+            
+            if not close_prices:
+                logger.warning("Yahoo API no close prices")
+                yahoo_error = True
+                return None, True
+            
+            is_night_market = False
+            if market_state in ['pre', 'post', 'extended']:
+                is_night_market = True
+            elif self.is_beijing_night_window():
+                is_night_market = True
+            
+            regular_start = None
+            regular_end = None
+            trading_periods = meta.get('tradingPeriods', [[]])
+            if trading_periods and trading_periods[0]:
+                for period in trading_periods[0]:
+                    if period.get('timezone', '').startswith('America'):
+                        regular_start = period.get('start')
+                        regular_end = period.get('end')
+                        break
+            
+            if regular_start and regular_end and timestamps:
+                last_ts = timestamps[-1]
+                if last_ts < regular_start or last_ts >= regular_end:
+                    is_night_market = True
+            
+            previous_close = meta.get('previousClose')
+            last_price = close_prices[-1]
+            last_timestamp = timestamps[-1] if timestamps else None
+            
+            result_data = {
+                'symbol': 'SLV',
+                'last_price': last_price,
+                'previous_close': previous_close,
+                'timestamp': last_timestamp,
+                'is_night_market': is_night_market,
+                'data_source': 'yahoo_direct_api',
+                'market_status': 'night_session' if is_night_market else 'regular_hours',
+                'extended_hours_high': max(high_prices) if high_prices else None,
+                'extended_hours_low': min(low_prices) if low_prices else None,
+                'volume': int(volumes[-1]) if volumes else None,
+                'regular_price': meta.get('regularMarketPrice'),
+                'net_change': last_price - previous_close if previous_close and last_price else None,
+                'change_pct': ((last_price - previous_close) / previous_close * 100) if previous_close and last_price else None,
+            }
+            
+            return result_data, False
+            
+        except requests.exceptions.Timeout:
+            logger.error("Yahoo API timeout")
+            yahoo_error = True
+            return None, True
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Yahoo API request error: {e}")
+            yahoo_error = True
+            return None, True
+        except Exception as e:
+            logger.error(f"Yahoo API unexpected error: {e}")
+            yahoo_error = True
+            return None, True
+
+    def get_yahoo_quote_data(self) -> Tuple[Optional[Dict], bool]:
+        """
+        调用Yahoo Quote API获取报价信息
+        返回: (数据字典, 是否有错误)
+        """
+        try:
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15',
+                'Accept': '*/*',
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Referer': 'https://finance.yahoo.com/',
+            }
+            url = 'https://query1.finance.yahoo.com/v7/finance/quote?symbols=SLV'
+            response = self.session.get(url, headers=headers, timeout=15)
+            
+            if response.status_code == 429:
+                logger.warning("Yahoo Quote API rate limited (429)")
+                return None, True
+            if response.status_code != 200:
+                logger.warning(f"Yahoo Quote API returned status: {response.status_code}")
+                return None, True
+            
+            data = response.json()
+            quote = data.get('quoteResponse', {}).get('result', [])
+            if not quote:
+                logger.warning("Yahoo Quote API no result")
+                return None, True
+            
+            q = quote[0]
+            is_night_market = False
+            market_state = q.get('marketState', '').lower()
+            if market_state in ['pre', 'post', 'extended']:
+                is_night_market = True
+            elif self.is_beijing_night_window():
+                is_night_market = True
+            
+            result_data = {
+                'symbol': q.get('symbol'),
+                'last_price': q.get('regularMarketPrice'),
+                'net_change': q.get('regularMarketChange'),
+                'change_pct': q.get('regularMarketChangePercent'),
+                'volume': q.get('regularMarketVolume'),
+                'open': q.get('regularMarketOpen'),
+                'high': q.get('regularMarketDayHigh'),
+                'low': q.get('regularMarketDayLow'),
+                'previous_close': q.get('regularMarketPreviousClose'),
+                'pre_market_price': q.get('preMarketPrice'),
+                'post_market_price': q.get('postMarketPrice'),
+                'market_state': market_state,
+                'is_night_market': is_night_market,
+                'data_source': 'yahoo_quote_api',
+            }
+            
+            return result_data, False
+            
+        except requests.exceptions.Timeout:
+            logger.error("Yahoo Quote API timeout")
+            return None, True
+        except Exception as e:
+            logger.error(f"Yahoo Quote API error: {e}")
+            return None, True
 
     def get_intraday_data(self) -> Optional[pd.DataFrame]:
         """获取NASDAQ日内实时数据"""
@@ -211,32 +394,121 @@ class SLVDataFetcher:
         """
         获取实时报价
         数据源优先级：
-        1. NASDAQ API（盘前/盘中/盘后实时价格）- 主要来源
-        2. Yahoo Finance（夜盘价格）- 直接获取，补充延长时间数据
-        3. Qveris（最后备用）- 当以上都失败时使用
+        【北京时间8:00-16:00夜盘优先模式】:
+        1. Yahoo Direct API (夜盘分钟级数据)
+        2. Yahoo Quote API
+        3. yfinance 库
+        4. NASDAQ API
+        5. Qveris (最后备用)
+
+        【常规模式】:
+        1. NASDAQ API
+        2. Yahoo Finance (yfinance)
+        3. Qveris (最后备用)
         """
         quote = None
+        self.yahoo_error = False
+        is_night_window = self.is_beijing_night_window()
 
-        # 1. 先尝试 Nasdaq API（主要数据源）
+        if is_night_window:
+            logger.info("北京时间8:00-16:00，启用夜盘优先模式...")
+
+            quote = self._try_yahoo_night_data()
+            if not quote:
+                self.yahoo_error = True
+                logger.warning("Yahoo Direct API 失败，尝试 NASDAQ...")
+                quote = self._try_nasdaq_with_yahoo_fallback()
+        else:
+            logger.info("常规模式，优先尝试 NASDAQ...")
+            quote = self._try_nasdaq_with_yahoo_fallback()
+
+        if not quote:
+            logger.warning("主要数据源失败，尝试 Qveris 备用...")
+            qveris_data = self.qveris.get_quote("SLV")
+            if qveris_data and qveris_data.get('last_price'):
+                quote = qveris_data
+                quote['is_night_market'] = is_night_window
+                quote['yahoo_error'] = self.yahoo_error
+                logger.info(f"Using Qveris fallback: ${quote['last_price']}")
+
+        if quote:
+            if 'is_night_market' not in quote:
+                quote['is_night_market'] = is_night_window
+            if 'yahoo_error' not in quote:
+                quote['yahoo_error'] = self.yahoo_error
+            quote['beijing_night_window'] = is_night_window
+        else:
+            logger.error("所有数据源均失败!")
+
+        return quote
+
+    def _try_yahoo_night_data(self) -> Optional[Dict]:
+        """尝试获取 Yahoo 夜盘数据（Direct API + Quote API）"""
+        direct_api_error = False
+        quote_api_error = False
+
+        logger.info("尝试 Yahoo Direct API 获取夜盘数据...")
+        yahoo_data, has_error = self.get_yahoo_night_session_data()
+        direct_api_error = has_error
+        if yahoo_data:
+            logger.info(f"Yahoo Direct API success: ${yahoo_data['last_price']}")
+            yahoo_data['yahoo_error'] = False
+            return yahoo_data
+
+        logger.info("Yahoo Direct API 失败，尝试 Yahoo Quote API...")
+        yahoo_data, has_error = self.get_yahoo_quote_data()
+        quote_api_error = has_error
+        if yahoo_data:
+            logger.info(f"Yahoo Quote API success: ${yahoo_data['last_price']}")
+            yahoo_data['yahoo_error'] = False
+            return yahoo_data
+
+        self.yahoo_error = True
+        logger.info("Yahoo API 均失败，尝试 yfinance 库作为备用...")
+        yf_data = self.get_yfinance_data()
+        if yf_data and (yf_data.get('regular_price') or yf_data.get('post_market_price') or yf_data.get('pre_market_price')):
+            last_price = yf_data.get('post_market_price') or yf_data.get('pre_market_price') or yf_data.get('regular_price')
+            result = {
+                'symbol': 'SLV',
+                'name': 'iShares Silver Trust',
+                'last_price': last_price,
+                'net_change': None,
+                'change_pct': None,
+                'volume': None,
+                'timestamp': None,
+                'is_realtime': False,
+                'price_source': 'yfinance_night_fallback',
+                'market_status': 'night_session',
+                'is_night_market': True,
+                'yahoo_error': True,
+                'pre_market_price': yf_data.get('pre_market_price'),
+                'post_market_price': yf_data.get('post_market_price'),
+                'extended_hours_high': yf_data.get('extended_hours_high'),
+                'extended_hours_low': yf_data.get('extended_hours_low'),
+            }
+            logger.info(f"yfinance 夜盘数据获取成功（但 Yahoo API 失败）: ${last_price}")
+            return result
+
+        return None
+
+    def _try_nasdaq_with_yahoo_fallback(self) -> Optional[Dict]:
+        """尝试 NASDAQ API，失败则用 Yahoo 备用"""
         logger.info("Trying NASDAQ API...")
         quote = self._get_nasdaq_quote()
 
         if quote:
             logger.info(f"NASDAQ success: ${quote['last_price']}")
+            is_night = self.is_beijing_night_window()
+            quote['is_night_market'] = is_night or (quote.get('market_status') == 'extended_hours')
 
-            # 获取 Yahoo Finance 夜盘数据作为补充
-            logger.info("Fetching Yahoo Finance extended hours data...")
             yf_data = self.get_yfinance_data()
-
             if yf_data:
-                # 补充夜盘数据到 quote
                 quote['pre_market_price'] = yf_data.get('pre_market_price')
                 quote['post_market_price'] = yf_data.get('post_market_price')
                 quote['extended_hours_high'] = yf_data.get('extended_hours_high')
                 quote['extended_hours_low'] = yf_data.get('extended_hours_low')
                 quote['yfinance_regular_price'] = yf_data.get('regular_price')
 
-                # 如果当前是延长时间，且 NASDAQ 数据较旧，使用 Yahoo 的最新价格
                 if yf_data.get('is_extended_hours'):
                     if yf_data.get('pre_market_price') or yf_data.get('post_market_price'):
                         latest_yf = yf_data.get('pre_market_price') or yf_data.get('post_market_price')
@@ -245,14 +517,12 @@ class SLVDataFetcher:
                             quote['last_price'] = latest_yf
                             quote['market_status'] = 'extended_hours'
                             quote['price_source'] = 'yfinance_extended_hours'
-
-                logger.info(f"Yahoo Finance extended hours: pre=${yf_data.get('pre_market_price')}, post=${yf_data.get('post_market_price')}")
+                            quote['is_night_market'] = True
         else:
             logger.warning("NASDAQ API failed, trying Yahoo Finance...")
-
-            # 2. NASDAQ 失败，尝试 Yahoo Finance
             yf_data = self.get_yfinance_data()
             if yf_data and yf_data.get('regular_price'):
+                is_night = self.is_beijing_night_window() or yf_data.get('is_extended_hours', False)
                 quote = {
                     'symbol': 'SLV',
                     'name': 'iShares Silver Trust',
@@ -266,23 +536,14 @@ class SLVDataFetcher:
                     'is_realtime': False,
                     'price_source': 'yfinance',
                     'market_status': 'extended_hours' if yf_data.get('is_extended_hours') else 'regular_hours',
+                    'is_night_market': is_night,
+                    'yahoo_error': False,
                     'pre_market_price': yf_data.get('pre_market_price'),
                     'post_market_price': yf_data.get('post_market_price'),
                     'extended_hours_high': yf_data.get('extended_hours_high'),
                     'extended_hours_low': yf_data.get('extended_hours_low'),
                 }
                 logger.info(f"Using Yahoo Finance: ${quote['last_price']}")
-
-        # 3. 最后备用：Qveris
-        if not quote:
-            logger.warning("All primary sources failed, trying Qveris as fallback...")
-            qveris_data = self.qveris.get_quote("SLV")
-            if qveris_data and qveris_data.get('last_price'):
-                quote = qveris_data
-                logger.info(f"Using Qveris fallback: ${quote['last_price']}")
-
-        if not quote:
-            logger.error("All data sources failed!")
 
         return quote
 
